@@ -12,7 +12,9 @@ Exits: a stop loss, a trailing stop once the position is up, a fade in net
 flow, an inactivity exit when the curve goes quiet, or a time limit.
 Winners are scaled out in halves at +40% and +80% so a gap down cannot
 take the whole gain. The replay flattens whatever is left at the end of the
-window.
+window. A buy that fails (the replay fails ~2% of orders, on a draw seeded
+differently per phase) is retried twice within 600 slots rather than
+dropped, while the price has not run more than 20% past the entry.
 
 Guardrails: the run needs round trips of >= 0.01 SOL on at least 20 distinct
 coins and a max drawdown of 50%. No probe round trips are used: every entry
@@ -81,7 +83,14 @@ FADE_NET_SOL = 0.3
 MAX_HOLD = 2000
 HOLD_IF_UP = 0.50
 COOLDOWN = 120
-MAX_ENTRIES = 4          # most entries per curve over the run
+MAX_ENTRIES = 4
+# A buy that fails (2% of orders fail in the replay) is retried, not
+# dropped: a failed probe on the one coin that runs is the difference
+# between a winning and a losing run, and the failure draw is seeded
+# differently on every phase, so the bot must not hinge on one order.
+BUY_RETRY_WINDOW = 600
+BUY_RETRY_MAX = 2
+BUY_RETRY_MAX_RUNUP = 1.20          # most entries per curve over the run
 
 
 class Tape:
@@ -100,7 +109,8 @@ class Tape:
 
 class Held:
     __slots__ = ("opened", "peak", "invested", "exiting", "filled",
-                 "last_add_price", "last_value", "kind", "stake", "add", "scaled")
+                 "last_add_price", "last_value", "kind", "stake", "add", "scaled",
+                 "retry", "deadline")
 
     def __init__(self, opened, invested, last_add_price, kind, stake, add):
         self.opened = opened
@@ -114,6 +124,8 @@ class Held:
         self.stake = stake        # most SOL into this position in total
         self.add = add            # each pyramid add, SOL
         self.scaled = 0           # scale-out steps taken (0, 1, 2)
+        self.retry = 0            # failed initial buys retried so far
+        self.deadline = opened + BUY_RETRY_WINDOW
 
 
 tapes = {}
@@ -264,6 +276,9 @@ def on_batch(state, batch):
         curve = state.curves.get(mint)
         if pos is None:
             if mint not in pending_by_mint:
+                if (not h.filled and h.retry < BUY_RETRY_MAX
+                        and now <= h.deadline):
+                    continue  # buy failed: retry in the entry loop below
                 del held[mint]
                 t = tape_of(mint)
                 if h.filled:
@@ -366,10 +381,22 @@ def on_batch(state, batch):
                 continue
             want = min(initial, stake)
             is_new = True
+        elif not h.filled:
+            # Retry of a failed initial buy: same amount, only while the
+            # price has not run away and the order would fit the size cap.
+            if (h.retry < BUY_RETRY_MAX and now <= h.deadline
+                    and price <= h.last_add_price * BUY_RETRY_MAX_RUNUP
+                    and h.invested <= rq_sol * 0.0099
+                    and len(orders) < cap):
+                orders.append({"side": "buy", "mint": mint,
+                               "quote_lamports": int(h.invested * LAMPORTS),
+                               "max_slippage_bps": BUY_SLIP_BPS})
+                h.retry += 1
+            continue
         else:
             # Pyramid into strength only: the position is up, the price
             # stepped up from the last add, and net SOL still flows in.
-            if h.exiting or not h.filled or h.invested >= h.stake - MIN_BUY_SOL:
+            if h.exiting or h.invested >= h.stake - MIN_BUY_SOL:
                 continue
             pos = state.positions.get(mint)
             if pos is None:
